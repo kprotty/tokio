@@ -82,7 +82,6 @@ impl<T> Local<T> {
 
     /// Pushes a task to the back of the local queue, skipping the LIFO slot.
     pub(super) fn push_back(&mut self, task: task::Notified<T>, inject: &Inject<T>) {
-        let task = task.into_raw();
         let tail = self.inner.tail.load(Relaxed);
         let mut head = self.inner.head.load(Relaxed);
         
@@ -91,7 +90,8 @@ impl<T> Local<T> {
             assert!(size <= LOCAL_QUEUE_CAPACITY);
 
             if size < LOCAL_QUEUE_CAPACITY {
-                self.inner.buffer[tail & MASK].store(task.as_ptr(), Relaxed);
+                let task = task.into_raw().as_ptr();
+                self.inner.buffer[tail & MASK].store(task, Relaxed);
                 self.inner.tail.store(tail.wrapping_add(1), Release);
                 return;
             }
@@ -109,11 +109,13 @@ impl<T> Local<T> {
                 continue;
             }
 
-            let migrated = (0..migrate).map(|i| {
-                let slot = &self.inner.buffer[head.wrapping_add(i) & MASK];
-                let task = NonNull::new(slot.load(Relaxed)).unwrap();
-                unsafe { task::Notified::<T>::from_raw(task) }
-            });
+            let migrated = (0..migrate)
+                .map(|i| {
+                    let slot = &self.inner.buffer[head.wrapping_add(i) & MASK];
+                    let task = NonNull::new(slot.load(Relaxed)).unwrap();
+                    unsafe { task::Notified::<T>::from_raw(task) }
+                })
+                .chain(std::iter::once(task));
 
             inject.push_batch(migrated);
             return;
