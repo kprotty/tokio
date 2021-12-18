@@ -1,18 +1,22 @@
 //! Inject queue used to send wakeups to a work-stealing scheduler
 
-use crate::loom::sync::atomic::AtomicUsize;
-use crate::loom::sync::Mutex;
+use crate::loom::sync::atomic::{AtomicUsize, AtomicBool, AtomicPtr};
 use crate::runtime::task;
 
 use std::marker::PhantomData;
-use std::ptr::NonNull;
-use std::sync::atomic::Ordering::{Acquire, Release};
+use std::ptr::{null_mut, NonNull};
+use std::sync::atomic::Ordering::{Acquire, Release, AcqRel, Relaxed};
 
 /// Growable, MPMC queue used to inject new tasks into the scheduler and as an
 /// overflow queue when the local, fixed-size, array queue overflows.
 pub(crate) struct Inject<T: 'static> {
-    /// Pointers to the head and tail of the queue.
-    pointers: Mutex<Pointers>,
+    is_closed: AtomicBool,
+
+    is_consuming: AtomicBool,
+
+    head: AtomicPtr<task::Header>,
+
+    tail: AtomicPtr<task::Header>,
 
     /// Number of pending tasks in the queue. This helps prevent unnecessary
     /// locking in the hot path.
@@ -21,28 +25,13 @@ pub(crate) struct Inject<T: 'static> {
     _p: PhantomData<T>,
 }
 
-struct Pointers {
-    /// True if the queue is closed.
-    is_closed: bool,
-
-    /// Linked-list head.
-    head: Option<NonNull<task::Header>>,
-
-    /// Linked-list tail.
-    tail: Option<NonNull<task::Header>>,
-}
-
-unsafe impl<T> Send for Inject<T> {}
-unsafe impl<T> Sync for Inject<T> {}
-
 impl<T: 'static> Inject<T> {
     pub(crate) fn new() -> Inject<T> {
         Inject {
-            pointers: Mutex::new(Pointers {
-                is_closed: false,
-                head: None,
-                tail: None,
-            }),
+            is_closed: AtomicBool::new(false),
+            is_consuming: AtomicBool::new(false),
+            head: AtomicPtr::new(null_mut()),
+            tail: AtomicPtr::new(null_mut()),
             len: AtomicUsize::new(0),
             _p: PhantomData,
         }
@@ -55,18 +44,11 @@ impl<T: 'static> Inject<T> {
     /// Closes the injection queue, returns `true` if the queue is open when the
     /// transition is made.
     pub(crate) fn close(&self) -> bool {
-        let mut p = self.pointers.lock();
-
-        if p.is_closed {
-            return false;
-        }
-
-        p.is_closed = true;
-        true
+        !self.is_closed.swap(true, AcqRel)
     }
 
     pub(crate) fn is_closed(&self) -> bool {
-        self.pointers.lock().is_closed
+        self.is_closed.load(Acquire)
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -77,31 +59,7 @@ impl<T: 'static> Inject<T> {
     ///
     /// This does nothing if the queue is closed.
     pub(crate) fn push(&self, task: task::Notified<T>) {
-        // Acquire queue lock
-        let mut p = self.pointers.lock();
-
-        if p.is_closed {
-            return;
-        }
-
-        // safety: only mutated with the lock held
-        let len = unsafe { self.len.unsync_load() };
-        let task = task.into_raw();
-
-        // The next pointer should already be null
-        debug_assert!(get_next(task).is_none());
-
-        if let Some(tail) = p.tail {
-            // safety: Holding the Notified for a task guarantees exclusive
-            // access to the `queue_next` field.
-            set_next(tail, Some(task));
-        } else {
-            p.head = Some(task);
-        }
-
-        p.tail = Some(task);
-
-        self.len.store(len + 1, Release);
+        self.push_batch(std::iter::once(task))
     }
 
     /// Pushes several values into the queue.
@@ -122,12 +80,12 @@ impl<T: 'static> Inject<T> {
         // We are going to be called with an `std::iter::Chain`, and that
         // iterator overrides `for_each` to something that is easier for the
         // compiler to optimize than a loop.
-        iter.for_each(|next| {
+        iter.for_each(|next| unsafe {
             let next = next.into_raw();
 
             // safety: Holding the Notified for a task guarantees exclusive
             // access to the `queue_next` field.
-            set_next(prev, Some(next));
+            prev.as_ref().queue_next.store(next.as_ptr(), Relaxed);
             prev = next;
             counter += 1;
         });
@@ -148,25 +106,23 @@ impl<T: 'static> Inject<T> {
         batch_tail: NonNull<task::Header>,
         num: usize,
     ) {
-        debug_assert!(get_next(batch_tail).is_none());
-
-        let mut p = self.pointers.lock();
-
-        if let Some(tail) = p.tail {
-            set_next(tail, Some(batch_head));
-        } else {
-            p.head = Some(batch_head);
+        if self.is_closed() {
+            return;
         }
 
-        p.tail = Some(batch_tail);
+        self.len.fetch_add(num, Relaxed);
 
-        // Increment the count.
-        //
-        // safety: All updates to the len atomic are guarded by the mutex. As
-        // such, a non-atomic load followed by a store is safe.
-        let len = unsafe { self.len.unsync_load() };
+        unsafe {
+            batch_tail.as_ref().queue_next.store(null_mut(), Relaxed);
+            let tail = self.tail.swap(batch_tail.as_ptr(), Release);
 
-        self.len.store(len + num, Release);
+            let link: *const AtomicPtr<task::Header> = match NonNull::new(tail) {
+                Some(tail) => &tail.as_ref().queue_next,
+                None => &self.head,
+            };
+
+            (&*link).store(batch_head.as_ptr(), Release);
+        }
     }
 
     pub(crate) fn pop(&self) -> Option<task::Notified<T>> {
@@ -175,29 +131,46 @@ impl<T: 'static> Inject<T> {
             return None;
         }
 
-        let mut p = self.pointers.lock();
-
-        // It is possible to hit null here if another thread popped the last
-        // task between us checking `len` and acquiring the lock.
-        let task = p.head?;
-
-        p.head = get_next(task);
-
-        if p.head.is_none() {
-            p.tail = None;
+        if self.is_consuming.swap(true, Acquire) {
+            return None;
         }
 
-        set_next(task, None);
+        let task = (|| unsafe {
+            let head = NonNull::new(self.head.load(Acquire))?;
 
-        // Decrement the count.
-        //
-        // safety: All updates to the len atomic are guarded by the mutex. As
-        // such, a non-atomic load followed by a store is safe.
-        self.len
-            .store(unsafe { self.len.unsync_load() } - 1, Release);
+            if let Some(next) = NonNull::new(head.as_ref().queue_next.load(Acquire)) {
+                self.head.store(next.as_ptr(), Relaxed);
+                return Some(head);
+            }
+
+            let tail = NonNull::new(self.tail.load(Acquire)).unwrap();
+            if head == tail {
+                self.head.store(null_mut(), Relaxed);
+
+                match self.tail.compare_exchange(
+                    head.as_ptr(),
+                    null_mut(),
+                    AcqRel,
+                    Acquire,
+                ) {
+                    Ok(_) => return Some(head),
+                    Err(_) => self.head.store(head.as_ptr(), Relaxed),
+                }
+            }
+
+            let next = NonNull::new(head.as_ref().queue_next.load(Acquire))?;
+            self.head.store(next.as_ptr(), Relaxed);
+            Some(head)
+        })();
+
+        if task.is_some() {
+            self.len.fetch_sub(1, Relaxed);
+        }
+
+        self.is_consuming.store(false, Release);
 
         // safety: a `Notified` is pushed into the queue and now it is popped!
-        Some(unsafe { task::Notified::from_raw(task) })
+        task.map(|task| unsafe { task::Notified::from_raw(task) })
     }
 }
 
@@ -209,12 +182,3 @@ impl<T: 'static> Drop for Inject<T> {
     }
 }
 
-fn get_next(header: NonNull<task::Header>) -> Option<NonNull<task::Header>> {
-    unsafe { header.as_ref().queue_next.with(|ptr| *ptr) }
-}
-
-fn set_next(header: NonNull<task::Header>, val: Option<NonNull<task::Header>>) {
-    unsafe {
-        header.as_ref().set_next(val);
-    }
-}

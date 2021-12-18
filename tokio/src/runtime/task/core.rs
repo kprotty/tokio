@@ -11,13 +11,14 @@
 
 use crate::future::Future;
 use crate::loom::cell::UnsafeCell;
+use crate::loom::sync::atomic::AtomicPtr;
 use crate::runtime::task::raw::{self, Vtable};
 use crate::runtime::task::state::State;
 use crate::runtime::task::Schedule;
 use crate::util::linked_list;
 
 use std::pin::Pin;
-use std::ptr::NonNull;
+use std::ptr::null_mut;
 use std::task::{Context, Poll, Waker};
 
 /// The task cell. Contains the components of the task.
@@ -60,7 +61,7 @@ pub(crate) struct Header {
     pub(super) owned: UnsafeCell<linked_list::Pointers<Header>>,
 
     /// Pointer to next task, used with the injection queue.
-    pub(super) queue_next: UnsafeCell<Option<NonNull<Header>>>,
+    pub(super) queue_next: AtomicPtr<Header>,
 
     /// Table of function pointers for executing actions on the task.
     pub(super) vtable: &'static Vtable,
@@ -109,7 +110,7 @@ impl<T: Future, S: Schedule> Cell<T, S> {
             header: Header {
                 state,
                 owned: UnsafeCell::new(linked_list::Pointers::new()),
-                queue_next: UnsafeCell::new(None),
+                queue_next: AtomicPtr::new(null_mut()),
                 vtable: raw::vtable::<T, S>(),
                 owner_id: UnsafeCell::new(0),
                 #[cfg(all(tokio_unstable, feature = "tracing"))]
@@ -212,14 +213,6 @@ impl<T: Future> CoreStage<T> {
 
     unsafe fn set_stage(&self, stage: Stage<T>) {
         self.stage.with_mut(|ptr| *ptr = stage)
-    }
-}
-
-cfg_rt_multi_thread! {
-    impl Header {
-        pub(super) unsafe fn set_next(&self, next: Option<NonNull<Header>>) {
-            self.queue_next.with_mut(|ptr| *ptr = next);
-        }
     }
 }
 
