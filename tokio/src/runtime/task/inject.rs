@@ -131,6 +131,10 @@ impl<T: 'static> Inject<T> {
             return None;
         }
 
+        if self.is_consuming.load(Relaxed) {
+            return None;
+        }
+
         if self.is_consuming.swap(true, Acquire) {
             return None;
         }

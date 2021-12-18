@@ -551,6 +551,11 @@ impl Core {
 
         for i in 0..num {
             let i = (start + i) % num;
+            
+            // Check the injector as it's cheap to do so
+            if let Some(task) = worker.shared.inject.pop() {
+                return Some(task);
+            }
 
             // Don't steal from ourself! We know we don't have work.
             if i == worker.index {
@@ -566,8 +571,7 @@ impl Core {
             }
         }
 
-        // Fallback on checking the global queue
-        worker.shared.inject.pop()
+        None
     }
 
     fn transition_to_searching(&mut self, worker: &Worker) -> bool {
