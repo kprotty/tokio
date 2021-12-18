@@ -137,7 +137,7 @@
 
 mod core;
 use self::core::Cell;
-use self::core::Header;
+pub(super) use self::core::Header;
 
 mod error;
 #[allow(unreachable_pub)] // https://github.com/rust-lang/rust/issues/57411
@@ -306,7 +306,7 @@ impl<S: 'static> Notified<S> {
 
 cfg_rt_multi_thread! {
     impl<S: 'static> Notified<S> {
-        unsafe fn from_raw(ptr: NonNull<Header>) -> Notified<S> {
+        pub(super) unsafe fn from_raw(ptr: NonNull<Header>) -> Notified<S> {
             Notified(Task::from_raw(ptr))
         }
     }
@@ -320,7 +320,7 @@ cfg_rt_multi_thread! {
     }
 
     impl<S: 'static> Notified<S> {
-        fn into_raw(self) -> NonNull<Header> {
+        pub(super) fn into_raw(self) -> NonNull<Header> {
             self.0.into_raw()
         }
     }
